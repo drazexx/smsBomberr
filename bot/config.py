@@ -15,7 +15,7 @@ _ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ADMIN_ID: int = 961369378
 
 # Protected number - cannot be used as a test target by anyone
-PROTECTED_NUMBER: str = "87075046930"
+PROTECTED_NUMBER: str = "8075046930"
 
 # Default daily test limit for new users
 DEFAULT_DAILY_LIMIT: int = 10

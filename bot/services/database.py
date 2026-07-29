@@ -6,7 +6,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 
-import libsql_experimental as libsql
+import sqlite3 as libsql
 from dotenv import load_dotenv
 
 from bot.config import DEFAULT_DAILY_LIMIT, IST_OFFSET_HOURS
@@ -15,14 +15,8 @@ load_dotenv()
 
 IST = timezone(timedelta(hours=IST_OFFSET_HOURS))
 
-TURSO_URL   = os.getenv("TURSO_URL", "")
-TURSO_TOKEN = os.getenv("TURSO_TOKEN", "")
-
-if not TURSO_URL or not TURSO_TOKEN:
-    raise RuntimeError("TURSO_URL and TURSO_TOKEN must be set in your .env file.")
-
-LOCAL_DB_PATH   = "/app/local_replica.db"
-SYNC_EVERY      = 15   # sync to Turso every N writes
+LOCAL_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.db")
+SYNC_EVERY    = 15
 
 
 def getIstToday() -> str:
@@ -41,24 +35,19 @@ class Database:
         self._writeCount = 0
 
         # In-memory caches — instant reads
-        self._userCache:     Dict[int, Dict]   = {}
-        self._settingCache:  Dict[str, str]    = {}
-        self._skippedCache:  Optional[set]     = None
-        self._blacklistCache: Optional[set]    = None
-        self._favCache:      Dict[int, List]   = {}
-        self._presetCache:   Dict[int, List]   = {}
+        self._userCache:      Dict[int, Dict] = {}
+        self._settingCache:   Dict[str, str]  = {}
+        self._skippedCache:   Optional[set]   = None
+        self._blacklistCache: Optional[set]   = None
+        self._favCache:       Dict[int, List] = {}
+        self._presetCache:    Dict[int, List] = {}
 
-        self._conn = libsql.connect(
-            database=LOCAL_DB_PATH,
-            sync_url=TURSO_URL,
-            auth_token=TURSO_TOKEN,
-        )
-        self._conn.sync()
+        self._conn = libsql.connect(LOCAL_DB_PATH)
+        self._conn.row_factory = libsql.Row
         self._createTables()
         self._warmCache()
 
     def _warmCache(self) -> None:
-        """Load hot data into memory on startup — after this reads are instant."""
         try:
             rows = self._fetchall("SELECT key, value FROM botSettings")
             for r in rows:
@@ -212,7 +201,6 @@ class Database:
                 self._conn.commit()
             except Exception:
                 pass
-        self._conn.sync()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -224,8 +212,6 @@ class Database:
             self._conn.commit()
             self._writeCount += 1
             if self._writeCount >= SYNC_EVERY:
-                try: self._conn.sync()
-                except Exception: pass
                 self._writeCount = 0
             return cur
 
@@ -248,13 +234,10 @@ class Database:
             return [dict(zip(cols, r)) for r in rows]
 
     def _forceSync(self) -> None:
-        with self._lock:
-            try: self._conn.sync()
-            except Exception: pass
-            self._writeCount = 0
+        self._writeCount = 0
 
     # ------------------------------------------------------------------
-    # Bot settings — served from memory cache
+    # Bot settings
     # ------------------------------------------------------------------
 
     def getSetting(self, key: str, default: str = "") -> str:
@@ -263,7 +246,6 @@ class Database:
     def setSetting(self, key: str, value: str) -> None:
         self._settingCache[key] = value
         self._execute("INSERT OR REPLACE INTO botSettings (key, value) VALUES (?, ?)", (key, value))
-        self._forceSync()
 
     def isMaintenanceMode(self) -> bool:
         return self._settingCache.get("maintenanceMode", "0") == "1"
@@ -278,12 +260,11 @@ class Database:
         self.setSetting("maintenanceMsg", msg)
 
     # ------------------------------------------------------------------
-    # User management — served from memory cache
+    # User management
     # ------------------------------------------------------------------
 
     def registerUser(self, userId: int, username: Optional[str], firstName: str, lastName: Optional[str]) -> bool:
         if userId in self._userCache:
-            # Update display info in cache and DB
             self._userCache[userId]["username"]  = username
             self._userCache[userId]["firstName"] = firstName
             self._userCache[userId]["lastName"]  = lastName or ""
@@ -292,7 +273,6 @@ class Database:
                 (username, firstName, lastName or "", userId)
             )
             return False
-        # New user
         row = {
             "userId": userId, "username": username, "firstName": firstName,
             "lastName": lastName or "", "joinedAt": time.time(), "isBanned": 0,
@@ -306,7 +286,6 @@ class Database:
             "VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)",
             (userId, username, firstName, lastName or "", row["joinedAt"], DEFAULT_DAILY_LIMIT, row["lastResetDate"])
         )
-        self._forceSync()
         return True
 
     def getUser(self, userId: int) -> Optional[Dict[str, Any]]:
@@ -335,32 +314,28 @@ class Database:
         if userId in self._userCache:
             self._userCache[userId]["isBanned"] = 1
         self._execute("UPDATE users SET isBanned=1 WHERE userId=?", (userId,))
-        self._forceSync()
 
     def unbanUser(self, userId: int) -> None:
         if userId in self._userCache:
             self._userCache[userId]["isBanned"] = 0
         self._execute("UPDATE users SET isBanned=0 WHERE userId=?", (userId,))
-        self._forceSync()
 
     def setDailyLimit(self, userId: int, limit: int) -> None:
         if userId in self._userCache:
             self._userCache[userId]["dailyLimit"] = limit
         self._execute("UPDATE users SET dailyLimit=? WHERE userId=?", (limit, userId))
-        self._forceSync()
 
     def setGlobalDailyLimit(self, limit: int) -> None:
         for u in self._userCache.values():
             u["dailyLimit"] = limit
         self._execute("UPDATE users SET dailyLimit=?", (limit,))
-        self._forceSync()
 
     def getTopUsers(self, limit: int = 10) -> List[Dict[str, Any]]:
         users = sorted(self._userCache.values(), key=lambda u: u.get("testsTotal", 0), reverse=True)
         return [dict(u) for u in users[:limit]]
 
     # ------------------------------------------------------------------
-    # Daily limit + streak — all from cache
+    # Daily limit + streak
     # ------------------------------------------------------------------
 
     def _ensureResetForUser(self, userId: int) -> None:
@@ -384,14 +359,14 @@ class Database:
         if last == today:
             return
         if last == yesterday:
-            u["streakDays"]    = u.get("streakDays", 0) + 1
+            u["streakDays"]     = u.get("streakDays", 0) + 1
             u["lastStreakDate"] = today
             self._execute(
                 "UPDATE users SET streakDays=streakDays+1, lastStreakDate=? WHERE userId=?",
                 (today, userId)
             )
         else:
-            u["streakDays"]    = 1
+            u["streakDays"]     = 1
             u["lastStreakDate"] = today
             self._execute(
                 "UPDATE users SET streakDays=1, lastStreakDate=? WHERE userId=?",
@@ -439,7 +414,6 @@ class Database:
             "UPDATE users SET testsToday=0, lastResetDate=? WHERE userId=?",
             (getIstToday(), userId)
         )
-        self._forceSync()
 
     def resetAllTests(self) -> None:
         today = getIstToday()
@@ -447,7 +421,6 @@ class Database:
             u["testsToday"]    = 0
             u["lastResetDate"] = today
         self._execute("UPDATE users SET testsToday=0, lastResetDate=?", (today,))
-        self._forceSync()
 
     # ------------------------------------------------------------------
     # Test history
@@ -468,7 +441,6 @@ class Database:
             "UPDATE testHistory SET totalReqs=?, otpHits=?, errors=?, rps=?, finishedAt=?, apiSnapshot=? WHERE id=?",
             (totalReqs, otpHits, errors, rps, time.time(), apiSnapshot, recordId)
         )
-        self._forceSync()
 
     def getUserHistory(self, userId: int, limit: int = 10) -> List[Dict[str, Any]]:
         return self._fetchall(
@@ -505,7 +477,6 @@ class Database:
                 (name, method, url, configJson, time.time())
             )
             self._conn.commit()
-            self._conn.sync()
             return cur.lastrowid
 
     def getAllCustomApis(self) -> List[Dict[str, Any]]:
@@ -519,11 +490,9 @@ class Database:
             "UPDATE customApis SET name=?, method=?, url=?, configJson=? WHERE id=?",
             (name, method, url, configJson, apiId)
         )
-        self._forceSync()
 
     def deleteCustomApi(self, apiId: int) -> None:
         self._execute("DELETE FROM customApis WHERE id=?", (apiId,))
-        self._forceSync()
 
     # ------------------------------------------------------------------
     # API usage stats
@@ -558,7 +527,6 @@ class Database:
                 (label, content, proxyCount, time.time())
             )
             self._conn.commit()
-            self._conn.sync()
             return cur.lastrowid
 
     def getAllProxyFiles(self) -> List[Dict[str, Any]]:
@@ -569,7 +537,6 @@ class Database:
 
     def deleteProxyFile(self, fileId: int) -> None:
         self._execute("DELETE FROM proxyFiles WHERE id=?", (fileId,))
-        self._forceSync()
 
     def getAllProxies(self) -> List[str]:
         rows = self._fetchall("SELECT content FROM proxyFiles")
@@ -582,7 +549,7 @@ class Database:
         return proxies
 
     # ------------------------------------------------------------------
-    # Phone blacklist — served from memory cache
+    # Phone blacklist
     # ------------------------------------------------------------------
 
     def blacklistPhone(self, phone: str, reason: str = "") -> None:
@@ -592,13 +559,11 @@ class Database:
             "INSERT OR REPLACE INTO blacklistedPhones (phone, reason, addedAt) VALUES (?,?,?)",
             (phone, reason, time.time())
         )
-        self._forceSync()
 
     def unblacklistPhone(self, phone: str) -> None:
         if self._blacklistCache is not None:
             self._blacklistCache.discard(phone)
         self._execute("DELETE FROM blacklistedPhones WHERE phone=?", (phone,))
-        self._forceSync()
 
     def isPhoneBlacklisted(self, phone: str) -> bool:
         if self._blacklistCache is not None:
@@ -609,20 +574,18 @@ class Database:
         return self._fetchall("SELECT * FROM blacklistedPhones ORDER BY addedAt DESC")
 
     # ------------------------------------------------------------------
-    # Skipped APIs — served from memory cache
+    # Skipped APIs
     # ------------------------------------------------------------------
 
     def skipApi(self, name: str) -> None:
         if self._skippedCache is not None:
             self._skippedCache.add(name)
         self._execute("INSERT OR REPLACE INTO skippedApis (name, addedAt) VALUES (?,?)", (name, time.time()))
-        self._forceSync()
 
     def unskipApi(self, name: str) -> None:
         if self._skippedCache is not None:
             self._skippedCache.discard(name)
         self._execute("DELETE FROM skippedApis WHERE name=?", (name,))
-        self._forceSync()
 
     def getSkippedApiNames(self) -> set:
         if self._skippedCache is not None:
@@ -659,11 +622,11 @@ class Database:
                 "INSERT INTO favoriteNumbers (userId, phone, label, addedAt) VALUES (?,?,?,?)",
                 (userId, phone, label, time.time())
             )
-            self._favCache.pop(userId, None)  # invalidate cache
+            self._favCache.pop(userId, None)
             return True
         except Exception:
             return False
-
+ 
     def removeFavorite(self, userId: int, phone: str) -> None:
         self._execute("DELETE FROM favoriteNumbers WHERE userId=? AND phone=?", (userId, phone))
         self._favCache.pop(userId, None)
@@ -720,12 +683,10 @@ class Database:
             "INSERT INTO referrals (referrerId, referreeId, createdAt) VALUES (?,?,?)",
             (referrerId, referreeId, time.time())
         )
-        # Update cache
         for uid, bonus in [(referrerId, 3), (referreeId, 1)]:
             self._execute("UPDATE users SET bonusTests=bonusTests+? WHERE userId=?", (bonus, uid))
             if uid in self._userCache:
                 self._userCache[uid]["bonusTests"] = self._userCache[uid].get("bonusTests", 0) + bonus
-        self._forceSync()
         return True
 
     def getReferralCount(self, userId: int) -> int:
@@ -748,7 +709,6 @@ class Database:
                 (userId, phone, duration, workers, runAt, time.time())
             )
             self._conn.commit()
-            self._conn.sync()
             return cur.lastrowid
 
     def getDueScheduledTests(self) -> List[Dict[str, Any]]:
@@ -815,7 +775,6 @@ class Database:
 
     def close(self) -> None:
         try:
-            self._conn.sync()
             self._conn.close()
         except Exception:
             pass
